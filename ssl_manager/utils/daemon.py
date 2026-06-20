@@ -5,7 +5,6 @@ import signal
 from pathlib import Path
 from typing import Optional
 
-
 from ssl_manager.utils.logger import logger
 
 
@@ -47,11 +46,9 @@ class DaemonManager:
             except OSError:
                 pass
 
-    def start(self, target_func, *args, **kwargs) -> int:
+    def start(self, config_path: str = "config.yaml") -> int:
         """
-        启动后台守护进程。
-        Windows 下使用 CREATE_NEW_PROCESS_GROUP 分离，
-        Unix 下使用标准 double-fork 方式。
+        启动后台守护进程。通过 python -m ssl_manager.cli monitor --daemon-worker 启动子进程。
         返回子进程 PID。
         """
         if self.is_running():
@@ -59,23 +56,25 @@ class DaemonManager:
             raise RuntimeError(f"进程已在运行 (PID={existing_pid})")
 
         if os.name == "nt":
-            return self._start_windows(target_func, *args, **kwargs)
+            return self._start_windows(config_path)
         else:
-            return self._start_unix(target_func, *args, **kwargs)
+            return self._start_unix(config_path)
 
-    def _start_windows(self, target_func, *args, **kwargs) -> int:
-        import subprocess
-
-        script_path = Path(__file__).parent.parent / "cli.py"
-
-        cmd = [
+    def _build_worker_cmd(self, config_path: str) -> list:
+        return [
             sys.executable,
-            str(script_path),
+            "-m",
+            "ssl_manager.cli",
             "--config",
-            kwargs.get("config_path", "config.yaml"),
+            config_path,
             "monitor",
             "--daemon-worker",
         ]
+
+    def _start_windows(self, config_path: str) -> int:
+        import subprocess
+
+        cmd = self._build_worker_cmd(config_path)
 
         stdout_path = self.log_dir / "monitor.out.log"
         stderr_path = self.log_dir / "monitor.err.log"
@@ -112,53 +111,40 @@ class DaemonManager:
         logger.info(f"后台进程启动成功，PID={child_pid}")
         return child_pid
 
-    def _start_unix(self, target_func, *args, **kwargs) -> int:
-        try:
-            pid = os.fork()
-            if pid > 0:
-                sys.exit(0)
-        except OSError as e:
-            raise RuntimeError(f"第一次 fork 失败: {e}") from e
+    def _start_unix(self, config_path: str) -> int:
+        import subprocess
 
-        os.setsid()
-        os.umask(0)
-
-        try:
-            pid = os.fork()
-            if pid > 0:
-                sys.exit(0)
-        except OSError as e:
-            raise RuntimeError(f"第二次 fork 失败: {e}") from e
-
-        child_pid = os.getpid()
-
-        sys.stdout.flush()
-        sys.stderr.flush()
+        cmd = self._build_worker_cmd(config_path)
 
         stdout_path = self.log_dir / "monitor.out.log"
         stderr_path = self.log_dir / "monitor.err.log"
 
-        with open("/dev/null", "r") as devnull:
-            os.dup2(devnull.fileno(), sys.stdin.fileno())
-        with open(stdout_path, "a") as f:
-            os.dup2(f.fileno(), sys.stdout.fileno())
-        with open(stderr_path, "a") as f:
-            os.dup2(f.fileno(), sys.stderr.fileno())
-
-        self._write_pid()
-
-        def handle_term(signum, frame):
-            self._remove_pid()
-            sys.exit(0)
-
-        signal.signal(signal.SIGTERM, handle_term)
-        signal.signal(signal.SIGINT, handle_term)
+        stdout_f = open(stdout_path, "a")
+        stderr_f = open(stderr_path, "a")
 
         try:
-            target_func(*args, **kwargs)
-        finally:
-            self._remove_pid()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=stdout_f,
+                stderr=stderr_f,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=os.getcwd(),
+            )
+        except Exception:
+            stdout_f.close()
+            stderr_f.close()
+            raise
 
+        child_pid = proc.pid
+        with open(self.pid_file, "w") as f:
+            f.write(str(child_pid))
+
+        time.sleep(1)
+        if not self.is_running():
+            raise RuntimeError("子进程启动后立即退出，请检查日志")
+
+        logger.info(f"后台进程启动成功，PID={child_pid}")
         return child_pid
 
     def stop(self, timeout: int = 10) -> bool:
@@ -198,7 +184,10 @@ class DaemonManager:
         if self.is_running():
             logger.warning(f"进程未优雅停止，强制杀死 PID={pid}")
             try:
-                os.kill(pid, signal.SIGKILL)
+                if os.name == "nt":
+                    os.kill(pid, signal.SIGTERM)
+                else:
+                    os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
             time.sleep(1)

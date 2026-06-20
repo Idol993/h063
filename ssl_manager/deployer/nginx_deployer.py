@@ -2,7 +2,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from ssl_manager.deployer.backup import BackupManager
 from ssl_manager.utils.logger import logger
@@ -27,17 +27,31 @@ class NginxDeployer:
             self._backup_existing_certs(domain, target_cert_path, target_key_path)
             self._copy_certificates(cert_path, key_path, target_cert_path, target_key_path)
 
-            if self._test_config():
-                self._reload_nginx()
-                logger.info(f"Nginx 证书部署成功: {domain}")
-                return True
-            else:
-                logger.error(f"Nginx 配置测试失败，回滚中...")
-                self._rollback(domain, target_cert_path, target_key_path)
+            test_ok = self._test_config()
+            if not test_ok:
+                logger.error(f"Nginx 配置测试未通过 (可能 nginx 未安装或配置有误)，回滚中...")
+                rollback_ok = self._rollback(domain, target_cert_path, target_key_path)
+                if not rollback_ok:
+                    logger.error(f"回滚失败: 无法恢复原始证书文件到 {target_cert_path}, {target_key_path}")
                 return False
 
+            reload_ok = self._reload_nginx()
+            if not reload_ok:
+                logger.error(f"Nginx 热重载失败，回滚中...")
+                rollback_ok = self._rollback(domain, target_cert_path, target_key_path)
+                if not rollback_ok:
+                    logger.error(f"回滚失败: 无法恢复原始证书文件到 {target_cert_path}, {target_key_path}")
+                return False
+
+            logger.info(f"Nginx 证书部署成功: {domain}")
+            return True
+
         except Exception as e:
-            logger.error(f"Nginx 部署失败: {e}")
+            logger.error(f"Nginx 部署异常: {e}")
+            try:
+                self._rollback(domain, target_cert_path, target_key_path)
+            except Exception as rb_e:
+                logger.error(f"回滚也失败: {rb_e}")
             return False
 
     def _backup_existing_certs(self, domain: str, cert_path: str, key_path: str):
@@ -49,6 +63,8 @@ class NginxDeployer:
 
         if files_to_backup:
             self.backup_manager.create_file_backup(files_to_backup, domain)
+        else:
+            logger.info("目标位置无现有证书文件，跳过备份")
 
     def _copy_certificates(self, src_cert: str, src_key: str, dst_cert: str, dst_key: str):
         dst_cert_path = Path(dst_cert)
@@ -60,8 +76,11 @@ class NginxDeployer:
         shutil.copy2(src_cert, dst_cert)
         shutil.copy2(src_key, dst_key)
 
-        os.chmod(dst_cert, 0o644)
-        os.chmod(dst_key, 0o600)
+        try:
+            os.chmod(dst_cert, 0o644)
+            os.chmod(dst_key, 0o600)
+        except OSError:
+            pass
 
         logger.info(f"证书文件已复制: {dst_cert}, {dst_key}")
 
@@ -77,16 +96,19 @@ class NginxDeployer:
                 logger.info("Nginx 配置测试通过")
                 return True
             else:
-                logger.error(f"Nginx 配置测试失败: {result.stderr}")
+                logger.error(f"Nginx 配置测试失败: {result.stderr.strip()}")
                 return False
         except FileNotFoundError:
-            logger.warning("nginx 命令未找到，跳过配置测试")
-            return True
+            logger.error(f"Nginx 命令未找到: {self.nginx_bin}，部署失败")
+            return False
+        except subprocess.TimeoutExpired:
+            logger.error("Nginx 配置测试超时")
+            return False
         except Exception as e:
             logger.error(f"Nginx 配置测试异常: {e}")
             return False
 
-    def _reload_nginx(self):
+    def _reload_nginx(self) -> bool:
         try:
             result = subprocess.run(
                 self.reload_command.split(),
@@ -96,27 +118,58 @@ class NginxDeployer:
             )
             if result.returncode == 0:
                 logger.info("Nginx 热重载成功")
+                return True
             else:
-                raise RuntimeError(f"Nginx 热重载失败: {result.stderr}")
+                logger.error(f"Nginx 热重载失败: {result.stderr.strip()}")
+                return False
         except FileNotFoundError:
-            logger.warning("nginx 命令未找到，跳过热重载")
+            logger.error(f"热重载命令未找到: {self.reload_command}")
+            return False
+        except subprocess.TimeoutExpired:
+            logger.error("Nginx 热重载超时")
+            return False
+        except Exception as e:
+            logger.error(f"Nginx 热重载异常: {e}")
+            return False
 
-    def _rollback(self, domain: str, cert_path: str, key_path: str):
+    def _rollback(self, domain: str, cert_path: str, key_path: str) -> bool:
         backups = self.backup_manager.list_backups(domain)
-        if backups:
-            latest_backup = backups[0]
+        if not backups:
+            logger.warning("没有可用的备份，无法回滚")
+            return False
+
+        latest_backup = backups[0]
+        target_path_map: Dict[str, str] = {}
+        cert_name = Path(cert_path).name
+        key_name = Path(key_path).name
+
+        backup_contents = self.backup_manager.list_backup_contents(str(latest_backup))
+
+        for name in backup_contents:
+            if name == cert_name:
+                target_path_map[name] = cert_path
+            elif name == key_name:
+                target_path_map[name] = key_path
+
+        if not target_path_map:
+            logger.warning(f"备份中未找到可恢复的证书文件 (期望: {cert_name}, {key_name})，尝试目录恢复")
             target_dir = str(Path(cert_path).parent)
-            self.backup_manager.restore_backup(str(latest_backup), target_dir)
-            logger.info(f"已回滚到备份: {latest_backup}")
+            return self.backup_manager.restore_backup(str(latest_backup), target_dir)
+
+        ok = self.backup_manager.restore_files_to_paths(str(latest_backup), target_path_map)
+        if ok:
+            logger.info(f"已回滚到备份: {latest_backup}，文件已恢复到原始目标路径")
             self._reload_nginx()
         else:
-            logger.warning("没有可用的备份，无法回滚")
+            logger.error(f"回滚失败: 文件未能恢复到目标路径 {cert_path}, {key_path}")
+
+        return ok
 
     def get_cert_paths(self, domain: str, base_path: Optional[str] = None) -> tuple:
         if base_path:
             base = Path(base_path)
         else:
-            base = Path(f"/etc/nginx/certs")
+            base = Path("/etc/nginx/certs")
 
         cert_path = base / domain / "fullchain.pem"
         key_path = base / domain / "privkey.pem"

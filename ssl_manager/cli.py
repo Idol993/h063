@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""SSL 证书管理命令行工具"""
 
 import sys
 import time
@@ -164,7 +163,6 @@ def _resolve_target_paths(config: AppConfig, domain_name: str, deploy_method: st
 
 
 def _auto_deploy(config: AppConfig, domain_name: str, cert_result: dict) -> bool:
-    """续期成功后自动部署证书"""
     domain_cfg = _get_domain_config(config, domain_name)
     deploy_method = domain_cfg.deploy_method if domain_cfg else None
 
@@ -208,6 +206,7 @@ def _auto_deploy(config: AppConfig, domain_name: str, cert_result: dict) -> bool
             console.print(f"  [green]部署成功: {deploy_method} 已热重载新证书[/green]")
         else:
             console.print(f"  [red]部署失败（已尝试回滚）: {deploy_method}[/red]")
+            console.print(f"  [red]请检查日志 logs/ssl_manager.log 了解详细原因[/red]")
         return success
 
     except Exception as e:
@@ -355,6 +354,7 @@ def renew(ctx, domain, force, staging, no_deploy):
         console.print(f"[red]DNS 服务商配置错误: {e}[/red]")
         sys.exit(1)
 
+    dns_provider_type = acme_config.dns_provider.type
     challenger = Challenger(acme_client, dns_provider)
     saver = CertificateSaver()
 
@@ -377,7 +377,10 @@ def renew(ctx, domain, force, staging, no_deploy):
             order = acme_client.new_order(cert_domains)
 
             if not challenger.perform_dns_challenges(order):
-                console.print(f"[red]域名 {domain_name} DNS-01 验证失败，请检查日志和 DNS 配置[/red]")
+                console.print(f"[red]域名 {domain_name} DNS-01 验证失败[/red]")
+                console.print(f"  DNS 服务商: {dns_provider_type}")
+                console.print(f"  请检查 DNS 服务商凭据、SDK 安装、以及域名是否在该服务商管理下")
+                console.print(f"  详细错误见日志 logs/ssl_manager.log")
                 continue
 
             order = acme_client.poll_for_status(order["order_url"], "ready")
@@ -409,7 +412,9 @@ def renew(ctx, domain, force, staging, no_deploy):
             console.print(f"  私钥路径: {cert_result['key_path']}")
 
         except DNSProviderError as e:
-            console.print(f"[red]DNS 操作失败（{domain_name}）: {e}[/red]")
+            console.print(f"[red]DNS 操作失败（{domain_name}）[/red]")
+            console.print(f"  DNS 服务商: {dns_provider_type}")
+            console.print(f"  失败原因: {e}")
             continue
         except ACMEClientError as e:
             console.print(f"[red]ACME 错误（{domain_name}）: {e}[/red]")
@@ -441,7 +446,7 @@ def renew(ctx, domain, force, staging, no_deploy):
 @click.option("--domain", "-d", required=True, help="部署指定域名的证书")
 @click.option("--cert", required=True, help="证书文件路径", type=click.Path(exists=True))
 @click.option("--key", required=True, help="私钥文件路径", type=click.Path(exists=True))
-@click.option("--chain", default="", help="证书链文件路径", type=click.Path(exists=True))
+@click.option("--chain", default="", help="证书链文件路径（可选）")
 @click.option("--method", "-m", type=click.Choice(["nginx", "apache"]), help="部署方式")
 @click.pass_context
 def deploy(ctx, domain, cert, key, chain, method):
@@ -482,7 +487,7 @@ def deploy(ctx, domain, cert, key, chain, method):
         if success:
             console.print(f"[green]Nginx 证书部署成功（已备份旧证书 + 热重载）: {domain}[/green]")
         else:
-            console.print(f"[red]Nginx 证书部署失败（已自动回滚）: {domain}[/red]")
+            console.print(f"[red]Nginx 证书部署失败（已尝试回滚）: {domain}[/red]")
             console.print(f"[red]请检查日志 logs/ssl_manager.log 或运行 `nginx -t` 诊断问题[/red]")
             sys.exit(1)
 
@@ -498,7 +503,7 @@ def deploy(ctx, domain, cert, key, chain, method):
         if success:
             console.print(f"[green]Apache 证书部署成功（已备份旧证书 + 热重载）: {domain}[/green]")
         else:
-            console.print(f"[red]Apache 证书部署失败（已自动回滚）: {domain}[/red]")
+            console.print(f"[red]Apache 证书部署失败（已尝试回滚）: {domain}[/red]")
             console.print(f"[red]请检查日志 logs/ssl_manager.log 或运行 `apachectl configtest` 诊断问题[/red]")
             sys.exit(1)
 
@@ -516,9 +521,6 @@ def monitor(ctx, action):
     """定时监控证书有效期（支持后台守护进程模式）"""
     config: AppConfig = ctx.obj.get("config")
     config_path = ctx.obj["config_path"]
-    if config is None:
-        click.echo("错误: 配置文件不存在", err=True)
-        sys.exit(1)
 
     daemon = DaemonManager(pid_file="./data/ssl_manager.pid", log_dir="./logs")
 
@@ -544,6 +546,10 @@ def monitor(ctx, action):
             sys.exit(1)
         return
 
+    if config is None:
+        click.echo("错误: 配置文件不存在", err=True)
+        sys.exit(1)
+
     if action == "restart":
         console.print("[cyan]重启监控进程...[/cyan]")
         if daemon.is_running():
@@ -557,7 +563,9 @@ def monitor(ctx, action):
     )
 
     def check_and_alert():
-        non_console = Console(file=open("./logs/monitor_console.log", "a", encoding="utf-8"))
+        log_file = Path("./logs/monitor_console.log")
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        non_console = Console(file=open(str(log_file), "a", encoding="utf-8"))
         non_console.print(f"\n=== 开始定时检查 ({time.strftime('%Y-%m-%d %H:%M:%S')}) ===")
         results = check_all_domains(config, show_progress=False)
         alerter.print_summary_table(results)
@@ -592,13 +600,26 @@ def monitor(ctx, action):
         return
 
     if action == "worker":
-        check_and_alert()
-        run_monitor(
-            check_time=config.monitor.check_time,
-            check_func=check_and_alert,
-            daemon=True,
-            check_interval_hours=config.monitor.check_interval_hours,
-        )
+        daemon._write_pid()
+
+        def handle_term(signum, frame):
+            daemon._remove_pid()
+            sys.exit(0)
+
+        import signal as sig_module
+        sig_module.signal(sig_module.SIGTERM, handle_term)
+        sig_module.signal(sig_module.SIGINT, handle_term)
+
+        try:
+            check_and_alert()
+            run_monitor(
+                check_time=config.monitor.check_time,
+                check_func=check_and_alert,
+                daemon=True,
+                check_interval_hours=config.monitor.check_interval_hours,
+            )
+        finally:
+            daemon._remove_pid()
         return
 
     if action == "start":
@@ -609,7 +630,7 @@ def monitor(ctx, action):
 
         console.print("[cyan]启动后台监控进程...[/cyan]")
         try:
-            pid = daemon.start(check_and_alert, config_path=config_path)
+            pid = daemon.start(config_path=config_path)
             console.print(f"[green]后台监控进程启动成功，PID={pid}[/green]")
             console.print(f"  查看状态: python -m ssl_manager.cli monitor --status")
             console.print(f"  停止进程: python -m ssl_manager.cli monitor --stop")
@@ -638,7 +659,7 @@ def info(ctx, domain):
             max_workers=1,
         )
     elif config is None:
-        click.echo("错误: 配置文件不存在", err=True)
+        click.echo("错误: 配置文件不存在，请使用 -c 指定配置文件或使用 -d 指定域名", err=True)
         sys.exit(1)
 
     ssl_client = SSLClient(timeout=config.timeout, proxy=config.proxy)
