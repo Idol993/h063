@@ -162,6 +162,47 @@ def _resolve_target_paths(config: AppConfig, domain_name: str, deploy_method: st
     return target_cert, target_key, target_chain
 
 
+def _format_deploy_failure(failure_type: str, failure_detail: str, deploy_method: str) -> list:
+    """格式化部署失败信息为多行字符串列表"""
+    lines = []
+    type_cn = {
+        "not_found_cmd": "命令未找到",
+        "config_test_failed": "配置测试未通过",
+        "reload_failed": "热重载失败",
+        "exception": "执行异常",
+    }
+    cn = type_cn.get(failure_type, failure_type or "未知错误")
+
+    lines.append(f"    失败类型: {cn}")
+    if deploy_method == "nginx":
+        if failure_type == "not_found_cmd":
+            lines.append(f"    请确认 nginx 是否已安装或配置正确的 nginx_bin 路径")
+        elif failure_type == "config_test_failed":
+            lines.append(f"    请运行 `nginx -t` 查看详细配置错误")
+        elif failure_type == "reload_failed":
+            lines.append(f"    请检查 nginx 是否正在运行 (例如 `ps aux | grep nginx`)")
+    elif deploy_method == "apache":
+        if failure_type == "not_found_cmd":
+            lines.append(f"    请确认 apachectl 是否已安装或配置正确的 apachectl_bin 路径")
+        elif failure_type == "config_test_failed":
+            lines.append(f"    请运行 `apachectl configtest` 查看详细配置错误")
+        elif failure_type == "reload_failed":
+            lines.append(f"    请检查 Apache 是否正在运行 (例如 `ps aux | grep httpd` 或 `systemctl status httpd`)")
+
+    if failure_detail:
+        lines.append(f"    错误详情: {failure_detail}")
+    return lines
+
+
+def _format_rollback(rollback) -> list:
+    """格式化回滚结果为多行字符串列表（支持 Nginx 和 Apache 的 RollbackResult/ApacheRollbackResult）"""
+    if rollback is None:
+        return ["    回滚: 未执行（部署在文件复制前已失败）"]
+    if not hasattr(rollback, "format_lines"):
+        return [f"    回滚: {rollback}"]
+    return rollback.format_lines()
+
+
 def _auto_deploy(config: AppConfig, domain_name: str, cert_result: dict) -> bool:
     domain_cfg = _get_domain_config(config, domain_name)
     deploy_method = domain_cfg.deploy_method if domain_cfg else None
@@ -178,6 +219,11 @@ def _auto_deploy(config: AppConfig, domain_name: str, cert_result: dict) -> bool
 
     target_cert, target_key, target_chain = _resolve_target_paths(config, domain_name, deploy_method)
 
+    console.print(f"    目标证书路径: {target_cert}")
+    console.print(f"    目标私钥路径: {target_key}")
+    if target_chain:
+        console.print(f"    目标证书链: {target_chain}")
+
     try:
         if deploy_method == "nginx":
             deployer = NginxDeployer(
@@ -186,7 +232,7 @@ def _auto_deploy(config: AppConfig, domain_name: str, cert_result: dict) -> bool
                 backup_dir=config.deploy.backup_dir,
                 backup_count=config.deploy.backup_count,
             )
-            success = deployer.deploy(domain_name, src_cert, src_key, target_cert, target_key)
+            result = deployer.deploy(domain_name, src_cert, src_key, target_cert, target_key)
         elif deploy_method == "apache":
             deployer = ApacheDeployer(
                 apachectl_bin=config.deploy.apache.apachectl_bin,
@@ -194,7 +240,7 @@ def _auto_deploy(config: AppConfig, domain_name: str, cert_result: dict) -> bool
                 backup_dir=config.deploy.backup_dir,
                 backup_count=config.deploy.backup_count,
             )
-            success = deployer.deploy(
+            result = deployer.deploy(
                 domain_name, src_cert, src_key, target_cert, target_key,
                 src_chain, target_chain
             )
@@ -202,12 +248,17 @@ def _auto_deploy(config: AppConfig, domain_name: str, cert_result: dict) -> bool
             console.print(f"  [yellow]未知部署方式: {deploy_method}，跳过[/yellow]")
             return False
 
-        if success:
+        if result.success:
             console.print(f"  [green]部署成功: {deploy_method} 已热重载新证书[/green]")
+            return True
         else:
-            console.print(f"  [red]部署失败（已尝试回滚）: {deploy_method}[/red]")
-            console.print(f"  [red]请检查日志 logs/ssl_manager.log 了解详细原因[/red]")
-        return success
+            console.print(f"  [red]部署失败: {deploy_method}[/red]")
+            for line in _format_deploy_failure(result.failure_type, result.failure_detail, deploy_method):
+                console.print(f"  {line}")
+            console.print(f"  [yellow]回滚结果:[/yellow]")
+            for line in _format_rollback(result.rollback):
+                console.print(f"  {line}")
+            return False
 
     except Exception as e:
         logger.error(f"自动部署 {domain_name} 到 {deploy_method} 失败: {e}")
@@ -376,11 +427,17 @@ def renew(ctx, domain, force, staging, no_deploy):
 
             order = acme_client.new_order(cert_domains)
 
-            if not challenger.perform_dns_challenges(order):
-                console.print(f"[red]域名 {domain_name} DNS-01 验证失败[/red]")
-                console.print(f"  DNS 服务商: {dns_provider_type}")
-                console.print(f"  请检查 DNS 服务商凭据、SDK 安装、以及域名是否在该服务商管理下")
-                console.print(f"  详细错误见日志 logs/ssl_manager.log")
+            chal_result = challenger.perform_dns_challenges(order)
+            if not chal_result.success:
+                console.print(f"[red]域名 {domain_name} DNS-01 验证失败 ({chal_result.success_count}/{chal_result.total_count} 成功)[/red]")
+                if chal_result.errors:
+                    console.print(f"[yellow]  共 {len(chal_result.errors)} 条失败详情:[/yellow]")
+                    for idx, err in enumerate(chal_result.errors, 1):
+                        console.print(f"  [red]--- 失败 #{idx} ---[/red]")
+                        for line in err.format().split("\n"):
+                            console.print(f"  {line}")
+                else:
+                    console.print(f"  请检查 DNS 服务商凭据、SDK 安装、以及域名是否在该服务商管理下")
                 continue
 
             order = acme_client.poll_for_status(order["order_url"], "ready")
@@ -483,12 +540,18 @@ def deploy(ctx, domain, cert, key, chain, method):
             backup_count=config.deploy.backup_count,
         )
 
-        success = deployer.deploy(domain, cert, key, target_cert, target_key)
-        if success:
+        result = deployer.deploy(domain, cert, key, target_cert, target_key)
+        if result.success:
             console.print(f"[green]Nginx 证书部署成功（已备份旧证书 + 热重载）: {domain}[/green]")
+            console.print(f"  已部署证书: {target_cert}")
+            console.print(f"  已部署私钥: {target_key}")
         else:
-            console.print(f"[red]Nginx 证书部署失败（已尝试回滚）: {domain}[/red]")
-            console.print(f"[red]请检查日志 logs/ssl_manager.log 或运行 `nginx -t` 诊断问题[/red]")
+            console.print(f"[red]Nginx 证书部署失败: {domain}[/red]")
+            for line in _format_deploy_failure(result.failure_type, result.failure_detail, deploy_method):
+                console.print(f"  {line}")
+            console.print(f"[yellow]  回滚结果:[/yellow]")
+            for line in _format_rollback(result.rollback):
+                console.print(f"  {line}")
             sys.exit(1)
 
     elif deploy_method == "apache":
@@ -499,12 +562,20 @@ def deploy(ctx, domain, cert, key, chain, method):
             backup_count=config.deploy.backup_count,
         )
 
-        success = deployer.deploy(domain, cert, key, target_cert, target_key, chain, target_chain or "")
-        if success:
+        result = deployer.deploy(domain, cert, key, target_cert, target_key, chain, target_chain or "")
+        if result.success:
             console.print(f"[green]Apache 证书部署成功（已备份旧证书 + 热重载）: {domain}[/green]")
+            console.print(f"  已部署证书: {target_cert}")
+            console.print(f"  已部署私钥: {target_key}")
+            if target_chain:
+                console.print(f"  已部署证书链: {target_chain}")
         else:
-            console.print(f"[red]Apache 证书部署失败（已尝试回滚）: {domain}[/red]")
-            console.print(f"[red]请检查日志 logs/ssl_manager.log 或运行 `apachectl configtest` 诊断问题[/red]")
+            console.print(f"[red]Apache 证书部署失败: {domain}[/red]")
+            for line in _format_deploy_failure(result.failure_type, result.failure_detail, deploy_method):
+                console.print(f"  {line}")
+            console.print(f"[yellow]  回滚结果:[/yellow]")
+            for line in _format_rollback(result.rollback):
+                console.print(f"  {line}")
             sys.exit(1)
 
 
