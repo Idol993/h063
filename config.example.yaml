@@ -1,0 +1,74 @@
+# SSL 证书管理工具配置文件示例
+
+# 域名列表（支持通配符 *.example.com）
+domains:
+  - domain: example.com
+    port: 443
+    deploy_method: nginx
+    cert_path: /etc/nginx/certs/example.com/fullchain.pem
+    key_path: /etc/nginx/certs/example.com/privkey.pem
+    auto_renew: true
+
+  - domain: api.example.com
+    port: 443
+    deploy_method: nginx
+    cert_path: /etc/nginx/certs/api.example.com/fullchain.pem
+    key_path: /etc/nginx/certs/api.example.com/privkey.pem
+    auto_renew: true
+
+  - domain: "*.app.example.com"
+    port: 443
+    deploy_method: apache
+    auto_renew: true
+
+# 告警配置
+notifier:
+  threshold:
+    warning_days: 30      # 警告阈值（天）
+    critical_days: 7      # 紧急阈值（天）
+
+  webhooks:
+    - url: https://oapi.dingtalk.com/robot/send?access_token=your_token
+      type: dingtalk
+      secret: your_secret
+
+    - url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=your_key
+      type: wecom
+
+# ACME 自动续期配置
+acme:
+  directory_url: https://acme-v02.api.letsencrypt.org/directory
+  email: admin@example.com
+  account_key_path: ./data/account.key
+  challenge_type: dns-01
+  staging: false
+
+  dns_provider:
+    type: aliyun  # aliyun / tencent / cloudflare
+    config:
+      access_key_id: your_access_key_id
+      access_key_secret: your_access_key_secret
+
+# 部署配置
+deploy:
+  nginx:
+    nginx_bin: nginx
+    reload_command: nginx -s reload
+
+  apache:
+    apachectl_bin: apachectl
+    reload_command: apachectl graceful
+
+  backup_dir: ./backups
+  backup_count: 5
+
+# 监控配置
+monitor:
+  check_time: "09:00"     # 每日检查时间
+  check_interval_hours: null  # 检查间隔小时数（设置则覆盖每日检查）
+  daemon: false
+
+# 全局配置
+timeout: 10              # 连接超时时间（秒）
+max_workers: 20          # 最大并发线程数
+proxy: null              # 代理地址，如 http://127.0.0.1:8080
