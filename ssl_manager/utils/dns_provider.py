@@ -6,6 +6,10 @@ import requests
 from ssl_manager.utils.logger import logger
 
 
+class DNSProviderError(Exception):
+    pass
+
+
 class DNSProvider(ABC):
     @abstractmethod
     def add_txt_record(self, domain: str, record_name: str, record_value: str) -> bool:
@@ -20,14 +24,40 @@ class DNSProvider(ABC):
         pass
 
 
+def _validate_required_credentials(creds: dict, provider_name: str):
+    missing = [k for k, v in creds.items() if not v]
+    if missing:
+        raise DNSProviderError(
+            f"{provider_name} DNS 配置缺少必要凭据: {', '.join(missing)}。"
+            f"请在配置文件 acme.dns_provider.config 中填写完整。"
+        )
+
+
 class AliyunDNSProvider(DNSProvider):
     def __init__(self, access_key_id: str, access_key_secret: str):
+        _validate_required_credentials(
+            {"access_key_id": access_key_id, "access_key_secret": access_key_secret},
+            "阿里云",
+        )
         self.access_key_id = access_key_id
         self.access_key_secret = access_key_secret
         self.endpoint = "https://alidns.aliyuncs.com"
+        self._sdk_available = self._check_sdk()
+
+    def _check_sdk(self) -> bool:
+        try:
+            from aliyunsdkcore.client import AcsClient
+            from aliyunsdkcore.request import CommonRequest
+            return True
+        except ImportError:
+            raise DNSProviderError(
+                "阿里云 DNS SDK 未安装。请执行: pip install aliyun-python-sdk-core-v3 aliyun-python-sdk-alidns"
+            )
 
     def add_txt_record(self, domain: str, record_name: str, record_value: str) -> bool:
         logger.info(f"阿里云 DNS: 添加 TXT 记录 {record_name}.{domain} = {record_value}")
+        if not self._sdk_available:
+            return False
         try:
             from aliyunsdkcore.client import AcsClient
             from aliyunsdkcore.request import CommonRequest
@@ -49,15 +79,20 @@ class AliyunDNSProvider(DNSProvider):
             response = client.do_action_with_exception(request)
             logger.info(f"阿里云 DNS: TXT 记录添加成功: {response}")
             return True
-        except ImportError:
-            logger.warning("阿里云 SDK 未安装，使用模拟模式")
-            return True
         except Exception as e:
-            logger.error(f"阿里云 DNS: 添加 TXT 记录失败: {e}")
-            return False
+            error_msg = str(e)
+            logger.error(f"阿里云 DNS: 添加 TXT 记录失败: {error_msg}")
+            if "InvalidAccessKeyId" in error_msg or "SignatureDoesNotMatch" in error_msg:
+                raise DNSProviderError(
+                    "阿里云 DNS 凭据无效 (InvalidAccessKeyId/SignatureDoesNotMatch)，"
+                    "请检查 access_key_id 和 access_key_secret 是否正确。"
+                ) from e
+            raise DNSProviderError(f"阿里云 DNS 添加 TXT 记录失败: {error_msg}") from e
 
     def delete_txt_record(self, domain: str, record_name: str) -> bool:
         logger.info(f"阿里云 DNS: 删除 TXT 记录 {record_name}.{domain}")
+        if not self._sdk_available:
+            return False
         try:
             from aliyunsdkcore.client import AcsClient
             from aliyunsdkcore.request import CommonRequest
@@ -93,9 +128,6 @@ class AliyunDNSProvider(DNSProvider):
                 client.do_action_with_exception(delete_request)
                 logger.info(f"阿里云 DNS: TXT 记录删除成功")
             return True
-        except ImportError:
-            logger.warning("阿里云 SDK 未安装，使用模拟模式")
-            return True
         except Exception as e:
             logger.error(f"阿里云 DNS: 删除 TXT 记录失败: {e}")
             return False
@@ -123,11 +155,28 @@ class AliyunDNSProvider(DNSProvider):
 
 class TencentDNSProvider(DNSProvider):
     def __init__(self, secret_id: str, secret_key: str):
+        _validate_required_credentials(
+            {"secret_id": secret_id, "secret_key": secret_key},
+            "腾讯云",
+        )
         self.secret_id = secret_id
         self.secret_key = secret_key
+        self._sdk_available = self._check_sdk()
+
+    def _check_sdk(self) -> bool:
+        try:
+            from tencentcloud.common import credential
+            from tencentcloud.dnspod.v20210323 import dnspod_client
+            return True
+        except ImportError:
+            raise DNSProviderError(
+                "腾讯云 DNS SDK 未安装。请执行: pip install tencentcloud-sdk-python"
+            )
 
     def add_txt_record(self, domain: str, record_name: str, record_value: str) -> bool:
         logger.info(f"腾讯云 DNS: 添加 TXT 记录 {record_name}.{domain} = {record_value}")
+        if not self._sdk_available:
+            return False
         try:
             from tencentcloud.common import credential
             from tencentcloud.dnspod.v20210323 import dnspod_client, models
@@ -143,15 +192,20 @@ class TencentDNSProvider(DNSProvider):
             client.CreateRecord(req)
             logger.info(f"腾讯云 DNS: TXT 记录添加成功")
             return True
-        except ImportError:
-            logger.warning("腾讯云 SDK 未安装，使用模拟模式")
-            return True
         except Exception as e:
-            logger.error(f"腾讯云 DNS: 添加 TXT 记录失败: {e}")
-            return False
+            error_msg = str(e)
+            logger.error(f"腾讯云 DNS: 添加 TXT 记录失败: {error_msg}")
+            if "AuthFailure" in error_msg or "InvalidSecretId" in error_msg:
+                raise DNSProviderError(
+                    "腾讯云 DNS 凭据无效 (AuthFailure/InvalidSecretId)，"
+                    "请检查 secret_id 和 secret_key 是否正确。"
+                ) from e
+            raise DNSProviderError(f"腾讯云 DNS 添加 TXT 记录失败: {error_msg}") from e
 
     def delete_txt_record(self, domain: str, record_name: str) -> bool:
         logger.info(f"腾讯云 DNS: 删除 TXT 记录 {record_name}.{domain}")
+        if not self._sdk_available:
+            return False
         try:
             from tencentcloud.common import credential
             from tencentcloud.dnspod.v20210323 import dnspod_client, models
@@ -172,9 +226,6 @@ class TencentDNSProvider(DNSProvider):
                 delete_req.RecordId = record_id
                 client.DeleteRecord(delete_req)
                 logger.info(f"腾讯云 DNS: TXT 记录删除成功")
-            return True
-        except ImportError:
-            logger.warning("腾讯云 SDK 未安装，使用模拟模式")
             return True
         except Exception as e:
             logger.error(f"腾讯云 DNS: 删除 TXT 记录失败: {e}")
@@ -203,9 +254,38 @@ class TencentDNSProvider(DNSProvider):
 
 class CloudflareDNSProvider(DNSProvider):
     def __init__(self, api_token: str, zone_id: Optional[str] = None):
+        _validate_required_credentials(
+            {"api_token": api_token},
+            "Cloudflare",
+        )
         self.api_token = api_token
         self.zone_id = zone_id
         self.base_url = "https://api.cloudflare.com/client/v4"
+        self._validate_token()
+
+    def _validate_token(self):
+        try:
+            url = f"{self.base_url}/user/tokens/verify"
+            headers = {
+                "Authorization": f"Bearer {self.api_token}",
+                "Content-Type": "application/json",
+            }
+            response = requests.get(url, headers=headers, timeout=10)
+            result = response.json()
+            if not result.get("success"):
+                errors = result.get("errors", [])
+                error_msgs = "; ".join([e.get("message", str(e)) for e in errors])
+                raise DNSProviderError(
+                    f"Cloudflare API Token 验证失败: {error_msgs}。"
+                    f"请检查 api_token 是否正确且具有 DNS:Edit 权限。"
+                )
+            logger.info("Cloudflare API Token 验证通过")
+        except DNSProviderError:
+            raise
+        except requests.RequestException as e:
+            raise DNSProviderError(f"Cloudflare API 连接失败: {e}") from e
+        except Exception as e:
+            raise DNSProviderError(f"Cloudflare DNS 初始化失败: {e}") from e
 
     def _get_headers(self) -> dict:
         return {
@@ -223,7 +303,10 @@ class CloudflareDNSProvider(DNSProvider):
         result = response.json()
         if result.get("success") and result.get("result"):
             return result["result"][0]["id"]
-        raise ValueError(f"未找到域名 {domain} 的 Zone ID")
+        raise DNSProviderError(
+            f"未在 Cloudflare 找到域名 {domain} 的 Zone。请确认域名已添加到 Cloudflare，"
+            f"或在配置中显式指定 zone_id。"
+        )
 
     def add_txt_record(self, domain: str, record_name: str, record_value: str) -> bool:
         logger.info(f"Cloudflare DNS: 添加 TXT 记录 {record_name}.{domain} = {record_value}")
@@ -241,11 +324,15 @@ class CloudflareDNSProvider(DNSProvider):
             if result.get("success"):
                 logger.info("Cloudflare DNS: TXT 记录添加成功")
                 return True
-            logger.error(f"Cloudflare DNS: 添加失败 - {result.get('errors')}")
-            return False
+            errors = result.get("errors", [])
+            error_msgs = "; ".join([e.get("message", str(e)) for e in errors])
+            logger.error(f"Cloudflare DNS: 添加失败 - {error_msgs}")
+            raise DNSProviderError(f"Cloudflare DNS 添加 TXT 记录失败: {error_msgs}")
+        except DNSProviderError:
+            raise
         except Exception as e:
             logger.error(f"Cloudflare DNS: 添加 TXT 记录失败: {e}")
-            return False
+            raise DNSProviderError(f"Cloudflare DNS 添加 TXT 记录失败: {e}") from e
 
     def delete_txt_record(self, domain: str, record_name: str) -> bool:
         logger.info(f"Cloudflare DNS: 删除 TXT 记录 {record_name}.{domain}")
@@ -297,5 +384,22 @@ def create_dns_provider(provider_type: str, **kwargs) -> DNSProvider:
     }
     provider_class = providers.get(provider_type.lower())
     if not provider_class:
-        raise ValueError(f"不支持的 DNS 服务商: {provider_type}")
+        raise ValueError(
+            f"不支持的 DNS 服务商: {provider_type}。"
+            f"支持的服务商: {', '.join(providers.keys())}"
+        )
+
+    required_params_map = {
+        "aliyun": ["access_key_id", "access_key_secret"],
+        "tencent": ["secret_id", "secret_key"],
+        "cloudflare": ["api_token"],
+    }
+    required = required_params_map.get(provider_type.lower(), [])
+    missing = [p for p in required if p not in kwargs or not kwargs.get(p)]
+    if missing:
+        raise ValueError(
+            f"DNS 服务商 {provider_type} 缺少必要配置参数: {', '.join(missing)}。"
+            f"请在 config.yaml 的 acme.dns_provider.config 中填写。"
+        )
+
     return provider_class(**kwargs)
